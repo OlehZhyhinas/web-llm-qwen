@@ -78,6 +78,8 @@ export class LLMChatPipeline {
   private fsoftmaxWithTemperature: tvmjs.PackedFunc;
   private fsampleWithTopP: tvmjs.PackedFunc;
   private fargsortProbs: tvmjs.PackedFunc;
+  private fargmaxLogits?: tvmjs.PackedFunc;
+  private fdecodeGreedy?: tvmjs.PackedFunc;
 
   // Functions related to PagedKVCache
   private fclearKVCaches: tvmjs.PackedFunc;
@@ -85,6 +87,7 @@ export class LLMChatPipeline {
   private fKVCacheRemoveSequence: tvmjs.PackedFunc;
   private fKVCacheBeginForward: tvmjs.PackedFunc;
   private fKVCacheEndForward: tvmjs.PackedFunc;
+  private fKVCachePopN: tvmjs.PackedFunc;
   private fKVCacheEnableSlidingWindowForSeq: tvmjs.PackedFunc;
 
   // parameter states
@@ -238,6 +241,8 @@ export class LLMChatPipeline {
       "create_rnn_state",
       "sample_with_top_p",
       "argsort_probs",
+      "argmax_logits",
+      "decode_greedy",
       "image_embed",
       "embed",
       "apply_bitmask_inplace",
@@ -334,6 +339,15 @@ export class LLMChatPipeline {
         vmFunctionRegistry,
       ),
     );
+    const argmaxLogits = vmFunctionRegistry.argmax_logits;
+    if (argmaxLogits !== undefined) {
+      this.fargmaxLogits = this.tvm.detachFromCurrentScope(argmaxLogits);
+    }
+    const decodeGreedy = vmFunctionRegistry.decode_greedy;
+    if (decodeGreedy !== undefined) {
+      this.fdecodeGreedy = this.tvm.detachFromCurrentScope(decodeGreedy);
+      log.info("Using fused decode_greedy kernel.");
+    }
     const imageEmbed = vmFunctionRegistry.image_embed;
     if (imageEmbed !== undefined) {
       this.image_embed = this.tvm.detachFromCurrentScope(imageEmbed);
@@ -410,6 +424,9 @@ export class LLMChatPipeline {
     );
     this.fKVCacheEndForward = this.tvm.detachFromCurrentScope(
       this.tvm.getGlobalFunc("vm.builtin.kv_state_end_forward"),
+    );
+    this.fKVCachePopN = this.tvm.detachFromCurrentScope(
+      this.tvm.getGlobalFunc("vm.builtin.kv_state_popn"),
     );
     this.fKVCacheEnableSlidingWindowForSeq = this.tvm.detachFromCurrentScope(
       this.tvm.getGlobalFunc(
@@ -497,6 +514,8 @@ export class LLMChatPipeline {
     this.kvCache?.dispose();
     this.fsampleWithTopP.dispose();
     this.fargsortProbs.dispose();
+    this.fargmaxLogits?.dispose();
+    this.fdecodeGreedy?.dispose();
     this.sampleIndicesDevice?.dispose();
     this.topPDevice?.dispose();
     this.vm.dispose();
@@ -925,7 +944,19 @@ export class LLMChatPipeline {
       throw Error("Cannot run decode when stopped");
     }
 
+    const burst = LLMChatPipeline.greedyBurstSize();
+    if (burst >= 2 && this.canGreedyBurst(genConfig)) {
+      await this.decodeGreedyBurst(burst, genConfig);
+      return;
+    }
+
     const tstart = performance.now();
+    const deferDecodeCleanup =
+      (
+        globalThis as typeof globalThis & {
+          __webllmDeferDecodeCleanup?: boolean;
+        }
+      ).__webllmDeferDecodeCleanup === true;
 
     this.tvm.beginScope();
     const chunk: Array<Array<number>> = [
@@ -941,11 +972,16 @@ export class LLMChatPipeline {
         "Internal Error: filledKVCacheLength does not match expected value.",
       );
     }
-    this.tvm.endScope();
+    if (!deferDecodeCleanup) {
+      this.tvm.endScope();
+    }
 
     // sample from logits
     const nextToken = await this.sampleTokenFromLogits(logits, genConfig);
     logits.dispose();
+    if (deferDecodeCleanup) {
+      this.tvm.endScope();
+    }
     const tend = performance.now();
 
     this.decodingTotalTime += (tend - tstart) / 1e3;
@@ -954,6 +990,166 @@ export class LLMChatPipeline {
     this.curRoundDecodingTotalTime += (tend - tstart) / 1e3;
 
     this.processNextToken(nextToken, genConfig);
+  }
+
+  private static greedyBurstSize(): number {
+    const raw = (
+      globalThis as typeof globalThis & { __webllmGreedyBurst?: number }
+    ).__webllmGreedyBurst;
+    const burst = Number(raw);
+    return Number.isInteger(burst) && burst >= 2 ? burst : 1;
+  }
+
+  private greedyArgmaxEnabled(): boolean {
+    return (
+      (
+        globalThis as typeof globalThis & {
+          __webllmGreedyArgmax?: boolean;
+        }
+      ).__webllmGreedyArgmax !== false
+    );
+  }
+
+  private canGreedyBurst(genConfig?: GenerationConfig): boolean {
+    if (!this.greedyArgmaxEnabled()) {
+      return false;
+    }
+    if (this.fargmaxLogits === undefined && this.fdecodeGreedy === undefined) {
+      return false;
+    }
+    const temperature = genConfig?.temperature ?? this.config.temperature;
+    if (temperature !== 0) {
+      return false;
+    }
+    if (genConfig?.logprobs) {
+      return false;
+    }
+    if (this.logitProcessor !== undefined) {
+      return false;
+    }
+    if (genConfig?.logit_bias && Object.keys(genConfig.logit_bias).length > 0) {
+      return false;
+    }
+    const frequency =
+      genConfig?.frequency_penalty ?? this.config.frequency_penalty ?? 0;
+    const presence =
+      genConfig?.presence_penalty ?? this.config.presence_penalty ?? 0;
+    const repetition =
+      genConfig?.repetition_penalty ?? this.config.repetition_penalty ?? 1;
+    if (frequency !== 0 || presence !== 0 || repetition !== 1) {
+      return false;
+    }
+    if (this.grammarMatcher !== undefined) {
+      return false;
+    }
+    return this.outputIds.length > 0;
+  }
+
+  private async decodeGreedyBurst(
+    burst: number,
+    genConfig?: GenerationConfig,
+  ): Promise<void> {
+    const tstart = performance.now();
+    const maxTokens = genConfig?.max_tokens ?? Infinity;
+    const remaining = Math.max(0, Number(maxTokens) - this.outputIds.length);
+    const steps = Math.min(burst, remaining);
+    if (steps < 1) {
+      return;
+    }
+
+    this.tvm.beginScope();
+    let tokenGpu = this.tvm.detachFromCurrentScope(
+      this.tvm
+        .empty([1], "int32", this.device)
+        .copyFrom(new Int32Array([this.outputIds[this.outputIds.length - 1]])),
+    );
+    const gpuTokens: tvmjs.Tensor[] = [];
+    for (let i = 0; i < steps; i++) {
+      const nextToken = this.fdecodeGreedy
+        ? this.invokeDecodeGreedy(tokenGpu)
+        : this.invokeDecodeGreedyFromParts(tokenGpu);
+      const kept = this.tvm.detachFromCurrentScope(nextToken);
+      gpuTokens.push(kept);
+      tokenGpu = kept;
+    }
+
+    const hosts = gpuTokens.map((token) => {
+      const host = this.tvm.empty([1], "int32", this.tvm.cpu());
+      host.copyFrom(token);
+      return host;
+    });
+    await this.device.sync();
+    const sampled = hosts.map((host) => (host.toArray() as Int32Array)[0]);
+    this.tvm.endScope();
+
+    let processed = 0;
+    for (const nextToken of sampled) {
+      if (this.stopTriggered) {
+        break;
+      }
+      this.processNextToken(nextToken, genConfig);
+      processed += 1;
+    }
+    const extra = sampled.length - processed;
+    if (extra > 0) {
+      for (const state of this.getActiveKVStates()) {
+        this.fKVCachePopN(
+          state,
+          new tvmjs.Scalar(0, "int64"),
+          new tvmjs.Scalar(extra, "int32"),
+        );
+      }
+      this.filledKVCacheLength -= extra;
+    }
+
+    const tend = performance.now();
+    this.decodingTotalTime += (tend - tstart) / 1e3;
+    this.decodingTotalTokens += processed;
+    this.curRoundDecodingTotalTokens += processed;
+    this.curRoundDecodingTotalTime += (tend - tstart) / 1e3;
+  }
+
+  private invokeDecodeGreedy(tokenGpu: tvmjs.Tensor): tvmjs.Tensor {
+    const inputLenShape = this.tvm.makeShapeTuple([1]);
+    const seqIdsTuple = this.tvm.makeShapeTuple([0]);
+    const forwardStates = this.getActiveKVStates();
+    for (const state of forwardStates) {
+      this.fKVCacheBeginForward!(state, seqIdsTuple, inputLenShape);
+    }
+    const retValue = this.fdecodeGreedy!(
+      tokenGpu,
+      this.getSingleStateForABI(),
+      this.params,
+    );
+    for (let i = forwardStates.length - 1; i >= 0; --i) {
+      this.fKVCacheEndForward!(forwardStates[i]);
+    }
+    this.filledKVCacheLength += 1;
+    const logits = retValue.get(0);
+    return this.fargmaxLogits!(logits.view([1, this.fullVocabSize]));
+  }
+
+  private invokeDecodeGreedyFromParts(tokenGpu: tvmjs.Tensor): tvmjs.Tensor {
+    const embed = this.getTokensEmbeddingsFromGpu(tokenGpu);
+    const allEmbeddings = embed.view([1].concat(embed.shape));
+    const inputLenShape = this.tvm.makeShapeTuple([1]);
+    const seqIdsTuple = this.tvm.makeShapeTuple([0]);
+    const forwardStates = this.getActiveKVStates();
+    for (const state of forwardStates) {
+      this.fKVCacheBeginForward!(state, seqIdsTuple, inputLenShape);
+    }
+    const retValue = this.invokeDecode(allEmbeddings);
+    for (let i = forwardStates.length - 1; i >= 0; --i) {
+      this.fKVCacheEndForward!(forwardStates[i]);
+    }
+    this.filledKVCacheLength += 1;
+    const logits = retValue.get(0);
+    return this.fargmaxLogits!(logits.view([1, this.fullVocabSize]));
+  }
+
+  private getTokensEmbeddingsFromGpu(inputData: tvmjs.Tensor): tvmjs.Tensor {
+    const embed: tvmjs.Tensor = this.embed!(inputData, this.params);
+    return embed;
   }
 
   /**
@@ -1254,8 +1450,18 @@ export class LLMChatPipeline {
     // TODO: we should combine string data to embed once, then rearrange the embeddings; currently
     // ["hi", imageUrl, "hi"] would call embed kernels 3 times, while 2 would suffice.
 
+    const deferDecodeCleanup =
+      inputDataLen === 1 &&
+      (
+        globalThis as typeof globalThis & {
+          __webllmDeferDecodeCleanup?: boolean;
+        }
+      ).__webllmDeferDecodeCleanup === true;
+
     // 1. Embed all inputData
-    this.tvm.beginScope();
+    if (!deferDecodeCleanup) {
+      this.tvm.beginScope();
+    }
     const embeddings: tvmjs.Tensor[] = [];
     for (let i = 0; i < inputData.length; i++) {
       const data = inputData[i];
@@ -1299,9 +1505,13 @@ export class LLMChatPipeline {
       this.fKVCacheEndForward!(forwardStates[i]);
     }
     this.filledKVCacheLength += inputDataLen;
-    const logits = this.tvm.detachFromCurrentScope(retValue.get(0));
-    this.tvm.endScope();
-    this.tvm.attachToCurrentScope(logits);
+    const logits = deferDecodeCleanup
+      ? retValue.get(0)
+      : this.tvm.detachFromCurrentScope(retValue.get(0));
+    if (!deferDecodeCleanup) {
+      this.tvm.endScope();
+      this.tvm.attachToCurrentScope(logits);
+    }
     return logits;
   }
 
@@ -1905,59 +2115,83 @@ export class LLMChatPipeline {
     // of i8) for cases where top_p is not set
     // 4. Sample token from logits
     const sampleBegin = performance.now();
-
-    // Inplace transform logitsOnCPU to a distribution
-    temperature = Math.max(1e-6, temperature); // to prevent division by zero
-
-    const numSeqs = 1;
-    const numProbs = 1;
-
-    const temperatures = new Float32Array([temperature]);
-
-    this.tvm.beginScope();
-    const temperaturesDevice = this.tvm
-      .empty([numSeqs], "float32", this.device)
-      .copyFrom(temperatures);
-
-    let probs = this.fsoftmaxWithTemperature(
-      logitsOnGPU.view([numSeqs, numProbs, this.fullVocabSize]),
-      temperaturesDevice,
-    );
-    probs = probs.view([numProbs, this.fullVocabSize]);
-
-    const topPValue = Math.max(top_p, 1e-5);
     let sampledToken = -1;
-    const argsortResults = this.fargsortProbs(probs);
-    const sortedProbsDevice = argsortResults.get(0);
-    const sortedIndicesDevice = argsortResults.get(1);
-    const uniformSamplesDevice = this.tvm.uniform([1], 0.0, 1.0, this.device);
 
-    const topPHost = new Float32Array(numProbs).fill(-1);
-    this.sampleIndices.forEach((row) => {
-      topPHost[row] = topPValue;
-    });
-    this.topPDevice.copyFrom(topPHost);
+    const greedyArgmaxEnabled =
+      (
+        globalThis as typeof globalThis & {
+          __webllmGreedyArgmax?: boolean;
+        }
+      ).__webllmGreedyArgmax !== false;
+    if (
+      temperature === 0 &&
+      !logprobs &&
+      greedyArgmaxEnabled &&
+      this.fargmaxLogits !== undefined
+    ) {
+      this.tvm.beginScope();
+      const argmaxDevice = this.fargmaxLogits(
+        logitsOnGPU.view([1, this.fullVocabSize]),
+      );
+      const argmaxHost = this.tvm.detachFromCurrentScope(
+        this.tvm.empty([1], "int32", this.tvm.cpu()).copyFrom(argmaxDevice),
+      );
+      this.tvm.endScope();
+      await this.device.sync();
+      sampledToken = argmaxHost.toArray()[0];
+      argmaxHost.dispose();
+    } else {
+      // Inplace transform logitsOnCPU to a distribution
+      temperature = Math.max(1e-6, temperature); // to prevent division by zero
 
-    const sampledTokensDevice = this.fsampleWithTopP(
-      sortedProbsDevice,
-      sortedIndicesDevice,
-      uniformSamplesDevice,
-      this.sampleIndicesDevice,
-      this.topPDevice,
-    );
-    const sampledTokensHost = this.tvm.detachFromCurrentScope(
-      this.tvm
-        .empty([numSeqs], "int32", this.tvm.cpu())
-        .copyFrom(sampledTokensDevice),
-    );
-    if (logprobs && top_logprobs! > 0) {
-      this.updateLogitsOnCPU(probs);
+      const numSeqs = 1;
+      const numProbs = 1;
+      const temperatures = new Float32Array([temperature]);
+
+      this.tvm.beginScope();
+      const temperaturesDevice = this.tvm
+        .empty([numSeqs], "float32", this.device)
+        .copyFrom(temperatures);
+
+      let probs = this.fsoftmaxWithTemperature(
+        logitsOnGPU.view([numSeqs, numProbs, this.fullVocabSize]),
+        temperaturesDevice,
+      );
+      probs = probs.view([numProbs, this.fullVocabSize]);
+
+      const topPValue = Math.max(top_p, 1e-5);
+      const argsortResults = this.fargsortProbs(probs);
+      const sortedProbsDevice = argsortResults.get(0);
+      const sortedIndicesDevice = argsortResults.get(1);
+      const uniformSamplesDevice = this.tvm.uniform([1], 0.0, 1.0, this.device);
+
+      const topPHost = new Float32Array(numProbs).fill(-1);
+      this.sampleIndices.forEach((row) => {
+        topPHost[row] = topPValue;
+      });
+      this.topPDevice.copyFrom(topPHost);
+
+      const sampledTokensDevice = this.fsampleWithTopP(
+        sortedProbsDevice,
+        sortedIndicesDevice,
+        uniformSamplesDevice,
+        this.sampleIndicesDevice,
+        this.topPDevice,
+      );
+      const sampledTokensHost = this.tvm.detachFromCurrentScope(
+        this.tvm
+          .empty([numSeqs], "int32", this.tvm.cpu())
+          .copyFrom(sampledTokensDevice),
+      );
+      if (logprobs && top_logprobs! > 0) {
+        this.updateLogitsOnCPU(probs);
+      }
+      this.tvm.endScope();
+      await this.device.sync();
+
+      sampledToken = sampledTokensHost.toArray()[0];
+      sampledTokensHost.dispose();
     }
-    this.tvm.endScope();
-    await this.device.sync();
-
-    sampledToken = sampledTokensHost.toArray()[0];
-    sampledTokensHost.dispose();
     if (sampledToken < 0) {
       throw new Error("InternalError: failed to sample a valid token.");
     }
