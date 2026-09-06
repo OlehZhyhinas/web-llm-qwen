@@ -435,6 +435,10 @@ export class MLCEngine implements MLCEngineInterface {
     // for all sync() to finish before proceeding (e.g. naive forEach does not work)
     for (const entry of Array.from(this.loadedModelIdToPipeline.entries())) {
       const pipeline = entry[1];
+      // Let queued GPU work and pending readbacks (e.g. greedy lookahead steps
+      // past a stop) settle before the device is destroyed; otherwise the
+      // pending mapAsync calls reject and the sync below rethrows them.
+      await pipeline.sync();
       pipeline.dispose();
       // Wait until device is actually destroyed so we can safely set deviceLostIsError back to true
       await pipeline.sync();
