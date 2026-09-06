@@ -958,7 +958,12 @@ export class LLMChatPipeline {
     }
 
     const burst = LLMChatPipeline.greedyBurstSize();
-    if (burst >= 2 && this.canGreedyBurst(genConfig)) {
+    // The GPU-resident path pays off with a burst of two or more, or with any
+    // lookahead: K=1 plus lookahead streams every token yet never syncs idle.
+    if (
+      (burst >= 2 || LLMChatPipeline.greedyLookahead() > 0) &&
+      this.canGreedyBurst(genConfig)
+    ) {
       await this.decodeGreedyBurst(burst, genConfig);
       return;
     }
