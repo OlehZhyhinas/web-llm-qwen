@@ -114,6 +114,14 @@ export class LLMChatPipeline {
   private outputMessage = "";
   private outputIds: Array<number> = [];
   private stopTriggered = false;
+  // Greedy decode steps issued to the GPU whose token has not been consumed
+  // yet, oldest first. `token` feeds the next step on the GPU; `host` receives
+  // its readback; `ready` resolves once `host` holds the value.
+  private greedyInflight: Array<{
+    token: tvmjs.Tensor;
+    host: tvmjs.Tensor;
+    ready: Promise<void>;
+  }> = [];
   private finishReason: ChatCompletionFinishReason | undefined = undefined;
   // frequency of appeared token ids till now (refresh after PrefillStep); token_id mapped to freq
   private appearedTokensFreq = new Map<number, number>();
@@ -503,6 +511,7 @@ export class LLMChatPipeline {
 
   dispose() {
     // TODO: Do we need to dispose all PackedFuncs here?
+    this.drainGreedyPipeline(false);
     this.grammarMatcher?.dispose();
     this.params.dispose();
     this.decoding.dispose();
@@ -548,6 +557,7 @@ export class LLMChatPipeline {
    * Reset the chat history
    */
   resetChat(keepStats = false) {
+    this.drainGreedyPipeline(false);
     this.tvm.beginScope();
     this.conversation.reset();
     if (!keepStats) {
@@ -755,6 +765,9 @@ export class LLMChatPipeline {
     }
 
     const tstart = performance.now();
+
+    // A generation aborted mid-burst may still have speculative steps queued.
+    this.drainGreedyPipeline(true);
 
     // cleanup the per convo states
     this.outputIds = [];
@@ -1045,52 +1058,156 @@ export class LLMChatPipeline {
     return this.outputIds.length > 0;
   }
 
+  private static greedyLookahead(): number {
+    const raw = (
+      globalThis as typeof globalThis & { __webllmBurstLookahead?: number }
+    ).__webllmBurstLookahead;
+    const lookahead = Number(raw);
+    return Number.isInteger(lookahead) && lookahead > 0 ? lookahead : 0;
+  }
+
+  /**
+   * The promise for every GPU->CPU readback issued so far, published by the
+   * patched WebGPU runtime. Falls back to a full device sync on an unpatched
+   * runtime, which keeps the result exact and only loses the overlap.
+   */
+  private readbackTail(): Promise<void> {
+    const tail = (
+      globalThis as typeof globalThis & {
+        __tvmjsWebGPUReadbackTail?: Promise<void>;
+      }
+    ).__tvmjsWebGPUReadbackTail;
+    return tail instanceof Promise ? tail : this.device.sync();
+  }
+
+  /**
+   * Issue one greedy decode step (embed -> decode -> argmax) on the GPU from a
+   * GPU-resident token and queue the readback of its result. Nothing here
+   * waits on the device.
+   */
+  private issueGreedyStep(prevToken: tvmjs.Tensor): {
+    token: tvmjs.Tensor;
+    host: tvmjs.Tensor;
+    ready: Promise<void>;
+  } {
+    this.tvm.beginScope();
+    const next = this.fdecodeGreedy
+      ? this.invokeDecodeGreedy(prevToken)
+      : this.invokeDecodeGreedyFromParts(prevToken);
+    const token = this.tvm.detachFromCurrentScope(next);
+    const host = this.tvm.detachFromCurrentScope(
+      this.tvm.empty([1], "int32", this.tvm.cpu()),
+    );
+    host.copyFrom(token);
+    this.tvm.endScope();
+    return { token, host, ready: this.readbackTail() };
+  }
+
+  /**
+   * Drop every queued speculative step. With `rollbackKV` the matching KV
+   * entries are popped as well; callers that clear the cache anyway pass false.
+   */
+  private drainGreedyPipeline(rollbackKV: boolean): void {
+    const extra = this.greedyInflight.length;
+    if (extra === 0) {
+      return;
+    }
+    for (const entry of this.greedyInflight) {
+      // The readback may still be in flight and will write into `host` when it
+      // lands, so release both tensors only once it has settled. It rejects
+      // only if the device is destroyed first; then there is nothing to free.
+      const release = () => {
+        try {
+          entry.host.dispose();
+          entry.token.dispose();
+        } catch {
+          /* runtime already disposed */
+        }
+      };
+      entry.ready.then(release, release);
+    }
+    this.greedyInflight = [];
+    if (rollbackKV) {
+      for (const state of this.getActiveKVStates()) {
+        this.fKVCachePopN(
+          state,
+          new tvmjs.Scalar(0, "int64"),
+          new tvmjs.Scalar(extra, "int32"),
+        );
+      }
+      this.filledKVCacheLength -= extra;
+    }
+  }
+
+  /**
+   * Exact greedy decode of `burst` tokens with the sampled token kept on the
+   * GPU between steps. With lookahead L > 0 a further L steps are issued before
+   * this burst is read back and stay queued on the GPU while the CPU reads,
+   * detokenizes and streams the burst, so the GPU never idles at the burst
+   * boundary. Lookahead steps past a stop are rolled back with kv_state_popn,
+   * exactly like the unread tail of a burst.
+   */
   private async decodeGreedyBurst(
     burst: number,
     genConfig?: GenerationConfig,
   ): Promise<void> {
     const tstart = performance.now();
-    const maxTokens = genConfig?.max_tokens ?? Infinity;
-    const remaining = Math.max(0, Number(maxTokens) - this.outputIds.length);
-    const steps = Math.min(burst, remaining);
-    if (steps < 1) {
+    const lookahead = LLMChatPipeline.greedyLookahead();
+    const maxTokens = Number(genConfig?.max_tokens ?? Infinity);
+
+    // Fill the pipeline up to burst + lookahead steps, never past max_tokens.
+    let seed: tvmjs.Tensor | undefined = undefined;
+    const want = burst + lookahead;
+    while (
+      this.greedyInflight.length < want &&
+      maxTokens - this.outputIds.length - this.greedyInflight.length > 0
+    ) {
+      let prev: tvmjs.Tensor;
+      if (this.greedyInflight.length > 0) {
+        prev = this.greedyInflight[this.greedyInflight.length - 1].token;
+      } else {
+        this.tvm.beginScope();
+        seed = this.tvm.detachFromCurrentScope(
+          this.tvm
+            .empty([1], "int32", this.device)
+            .copyFrom(
+              new Int32Array([this.outputIds[this.outputIds.length - 1]]),
+            ),
+        );
+        this.tvm.endScope();
+        prev = seed;
+      }
+      this.greedyInflight.push(this.issueGreedyStep(prev));
+    }
+
+    const count = Math.min(burst, this.greedyInflight.length);
+    if (count < 1) {
+      seed?.dispose();
       return;
     }
-
-    this.tvm.beginScope();
-    let tokenGpu = this.tvm.detachFromCurrentScope(
-      this.tvm
-        .empty([1], "int32", this.device)
-        .copyFrom(new Int32Array([this.outputIds[this.outputIds.length - 1]])),
-    );
-    const gpuTokens: tvmjs.Tensor[] = [];
-    for (let i = 0; i < steps; i++) {
-      const nextToken = this.fdecodeGreedy
-        ? this.invokeDecodeGreedy(tokenGpu)
-        : this.invokeDecodeGreedyFromParts(tokenGpu);
-      const kept = this.tvm.detachFromCurrentScope(nextToken);
-      gpuTokens.push(kept);
-      tokenGpu = kept;
-    }
-
-    const hosts = gpuTokens.map((token) => {
-      const host = this.tvm.empty([1], "int32", this.tvm.cpu());
-      host.copyFrom(token);
-      return host;
-    });
-    await this.device.sync();
-    const sampled = hosts.map((host) => (host.toArray() as Int32Array)[0]);
-    this.tvm.endScope();
+    // Wait only for the readbacks of this burst; lookahead steps keep running.
+    await this.greedyInflight[count - 1].ready;
+    const done = this.greedyInflight.splice(0, count);
 
     let processed = 0;
-    for (const nextToken of sampled) {
+    for (const entry of done) {
       if (this.stopTriggered) {
         break;
       }
-      this.processNextToken(nextToken, genConfig);
+      this.processNextToken((entry.host.toArray() as Int32Array)[0], genConfig);
       processed += 1;
     }
-    const extra = sampled.length - processed;
+    for (const entry of done) {
+      entry.host.dispose();
+      entry.token.dispose();
+    }
+    seed?.dispose();
+
+    let extra = done.length - processed;
+    if (this.stopTriggered) {
+      extra += this.greedyInflight.length;
+      this.drainGreedyPipeline(false);
+    }
     if (extra > 0) {
       for (const state of this.getActiveKVStates()) {
         this.fKVCachePopN(
