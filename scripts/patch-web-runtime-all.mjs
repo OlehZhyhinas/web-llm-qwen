@@ -12,6 +12,7 @@ const patches = [
   ["patch-web-runtime-flush-every.mjs", "__tvmjsWebGPUFlushEvery"],
   ["patch-web-runtime-bind-cache.mjs", "__tvmjsWebGPUBindGroupCache"],
   ["patch-web-runtime-readback-tail.mjs", "__tvmjsWebGPUReadbackTail"],
+  ["patch-web-runtime-same-buffer-copy.mjs", "__tvmjsWebGPUSameBufferCopy"],
 ];
 const runtimeFile = new URL("../node_modules/@mlc-ai/web-runtime/lib/index.js", import.meta.url);
 for (const [script, marker] of patches) {
