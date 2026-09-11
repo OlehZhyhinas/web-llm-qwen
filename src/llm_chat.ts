@@ -12,6 +12,7 @@ import {
   getTokenTableFromTokenizer,
   getTopProbs,
 } from "./support";
+import { PromptLookupIndex } from "./prompt_lookup";
 import {
   ChatCompletionFinishReason,
   ChatCompletionTokenLogprob,
@@ -40,6 +41,7 @@ type ComputeABIKind = "single" | "batch";
 type VMFunctionAvailability = {
   prefill: boolean;
   batch_prefill: boolean;
+  batch_verify: boolean;
   decode: boolean;
   batch_decode: boolean;
   create_tir_paged_kv_cache: boolean;
@@ -58,6 +60,32 @@ type ResolvedModelABI = {
   needsRNNState: boolean;
 };
 
+type PromptLookupRuntimeConfig = {
+  k: number;
+  nMin: number;
+  nMax: number;
+  hybrid?: "fork";
+};
+
+type PromptLookupStats = {
+  enabled: boolean;
+  disabledReason?: string;
+  passes: number;
+  draftPasses: number;
+  noDraftPasses: number;
+  draftedTokens: number;
+  acceptedTokens: number;
+  committedTokens: number;
+  fullAcceptPasses: number;
+  verifyMs: number;
+  verifyLens: number[];
+  verifyMsList: number[];
+  acceptedHist: number[];
+  rerunPasses: number;
+  rerunTokens: number;
+  rerunMs: number;
+};
+
 export class LLMChatPipeline {
   private config: ChatConfig;
   private tokenizer: Tokenizer;
@@ -68,6 +96,7 @@ export class LLMChatPipeline {
   private vm: tvmjs.VirtualMachine;
   private prefill: tvmjs.PackedFunc;
   private decoding: tvmjs.PackedFunc;
+  private batchVerify?: tvmjs.PackedFunc;
   private resolvedModelABI!: ResolvedModelABI;
   private kvStateKind: KVStateKind = "kv_cache";
   private image_embed: tvmjs.PackedFunc | undefined;
@@ -88,6 +117,7 @@ export class LLMChatPipeline {
   private fKVCacheBeginForward: tvmjs.PackedFunc;
   private fKVCacheEndForward: tvmjs.PackedFunc;
   private fKVCachePopN: tvmjs.PackedFunc;
+  private fKVCacheForkSequence: tvmjs.PackedFunc;
   private fKVCacheEnableSlidingWindowForSeq: tvmjs.PackedFunc;
 
   // parameter states
@@ -99,6 +129,7 @@ export class LLMChatPipeline {
   private maxHistorySize = 1;
   private logitsOnCPU?: tvmjs.Tensor = undefined;
   private filledKVCacheLength = 0;
+  private liveSeqId = 0;
 
   // meta data
   private bosTokenId = 1;
@@ -123,6 +154,28 @@ export class LLMChatPipeline {
     ready: Promise<void>;
   }> = [];
   private finishReason: ChatCompletionFinishReason | undefined = undefined;
+  private promptLookupSource: number[] = [];
+  private promptLookupIndex = new PromptLookupIndex();
+  private promptLookupNMin = 2;
+  private promptLookupNMax = 3;
+  private promptLookupHybridForkEnabled = false;
+  private promptLookupStats: PromptLookupStats = {
+    enabled: false,
+    passes: 0,
+    draftPasses: 0,
+    noDraftPasses: 0,
+    draftedTokens: 0,
+    acceptedTokens: 0,
+    committedTokens: 0,
+    fullAcceptPasses: 0,
+    verifyMs: 0,
+    verifyLens: [],
+    verifyMsList: [],
+    acceptedHist: [],
+    rerunPasses: 0,
+    rerunTokens: 0,
+    rerunMs: 0,
+  };
   // frequency of appeared token ids till now (refresh after PrefillStep); token_id mapped to freq
   private appearedTokensFreq = new Map<number, number>();
   private imageDataCache = new Map<string, ImageData>();
@@ -243,6 +296,7 @@ export class LLMChatPipeline {
     const vmFunctionRegistry = LLMChatPipeline.loadVMFunctionRegistry(this.vm, [
       "prefill",
       "batch_prefill",
+      "batch_verify",
       "decode",
       "batch_decode",
       "create_tir_paged_kv_cache",
@@ -301,6 +355,10 @@ export class LLMChatPipeline {
         vmFunctionRegistry,
       ),
     );
+    const batchVerify = vmFunctionRegistry.batch_verify;
+    if (batchVerify !== undefined) {
+      this.batchVerify = this.tvm.detachFromCurrentScope(batchVerify);
+    }
     if (this.resolvedModelABI.prefillABI === "batch") {
       log.info("Using batch_prefill kernel.");
     }
@@ -436,6 +494,9 @@ export class LLMChatPipeline {
     this.fKVCachePopN = this.tvm.detachFromCurrentScope(
       this.tvm.getGlobalFunc("vm.builtin.kv_state_popn"),
     );
+    this.fKVCacheForkSequence = this.tvm.detachFromCurrentScope(
+      this.tvm.getGlobalFunc("vm.builtin.kv_state_fork_sequence"),
+    );
     this.fKVCacheEnableSlidingWindowForSeq = this.tvm.detachFromCurrentScope(
       this.tvm.getGlobalFunc(
         "vm.builtin.attention_kv_cache_enable_sliding_window_for_seq",
@@ -443,7 +504,9 @@ export class LLMChatPipeline {
     );
 
     const defaultPageSize = 16;
-    const defaultMaxNumSequence = 1;
+    const promptLookupConfig = LLMChatPipeline.promptLookupConfig();
+    this.promptLookupHybridForkEnabled = promptLookupConfig?.hybrid === "fork";
+    const defaultMaxNumSequence = this.promptLookupHybridForkEnabled ? 2 : 1;
     const maxTotalSeqLen =
       this.slidingWindowSize != -1
         ? this.slidingWindowSize
@@ -480,8 +543,10 @@ export class LLMChatPipeline {
     }
 
     if (this.resolvedModelABI.prefillABI === "batch") {
+      // One sequence is forwarded per call even when the caches hold two
+      // (prompt-lookup fork mode), so this stays a single position.
       this.prefillLogitPositions = this.tvm.detachFromCurrentScope(
-        this.tvm.empty([defaultMaxNumSequence], "int32", this.device),
+        this.tvm.empty([1], "int32", this.device),
       );
     }
 
@@ -573,19 +638,24 @@ export class LLMChatPipeline {
    * Reset KV Cache
    */
   resetKVCache() {
+    this.liveSeqId = 0;
     const states = this.getActiveKVStates();
     for (const state of states) {
       this.fclearKVCaches(state);
-      this.fKVCacheAddSequence!(state, new tvmjs.Scalar(0, "int64"));
+      this.fKVCacheAddSequence!(
+        state,
+        new tvmjs.Scalar(this.getLiveSeqId(), "int64"),
+      );
     }
     if (this.slidingWindowSize != -1 && this.kvCache !== undefined) {
       this.fKVCacheEnableSlidingWindowForSeq(
         this.kvCache,
-        new tvmjs.Scalar(0, "int64"),
+        new tvmjs.Scalar(this.getLiveSeqId(), "int64"),
         new tvmjs.Scalar(this.slidingWindowSize, "int32"),
         new tvmjs.Scalar(this.attentionSinkSize, "int32"),
       );
     }
+    this.resetPromptLookupSource();
   }
 
   /**
@@ -664,9 +734,27 @@ export class LLMChatPipeline {
    * @returns Runtime stats information.
    */
   runtimeStatsText(): string {
+    const promptLookupStats = this.promptLookupStats;
+    const promptLookupLine =
+      `prompt_lookup: enabled=${promptLookupStats.enabled ? 1 : 0}, ` +
+      `passes=${promptLookupStats.passes}, ` +
+      `draft_passes=${promptLookupStats.draftPasses}, ` +
+      `no_draft_passes=${promptLookupStats.noDraftPasses}, ` +
+      `drafted=${promptLookupStats.draftedTokens}, ` +
+      `accepted=${promptLookupStats.acceptedTokens}, ` +
+      `committed=${promptLookupStats.committedTokens}, ` +
+      `full_accept=${promptLookupStats.fullAcceptPasses}, ` +
+      `verify_ms=${promptLookupStats.verifyMs.toFixed(3)}, ` +
+      `rerun_passes=${promptLookupStats.rerunPasses}, ` +
+      `rerun_tokens=${promptLookupStats.rerunTokens}, ` +
+      `rerun_ms=${promptLookupStats.rerunMs.toFixed(3)}` +
+      (promptLookupStats.disabledReason
+        ? `, disabled_reason=${promptLookupStats.disabledReason}`
+        : "");
     return (
       `prefill: ${(this.prefillTotalTokens / this.prefillTotalTime).toFixed(4)} tokens/sec, ` +
-      `decoding: ${(this.decodingTotalTokens / this.decodingTotalTime).toFixed(4)} tokens/sec`
+      `decoding: ${(this.decodingTotalTokens / this.decodingTotalTime).toFixed(4)} tokens/sec` +
+      `\n${promptLookupLine}`
     );
   }
 
@@ -780,6 +868,7 @@ export class LLMChatPipeline {
     this.curRoundDecodingTotalTime = 0;
     this.curRoundGrammarInitTotalTime = 0;
     this.curRoundGrammarPerTokenTotalTime = 0;
+    this.resetPromptLookupStatsForRound();
 
     this.curRoundLatencyBreakdown = {
       logitProcessorTime: [],
@@ -789,6 +878,7 @@ export class LLMChatPipeline {
       totalTime: [],
       grammarBitmaskTime: [],
     };
+    this.publishPromptLookupStats();
 
     this.stopTriggered = false;
     const conversation = this.conversation;
@@ -896,6 +986,8 @@ export class LLMChatPipeline {
       }
     }
     const [inputData, promptLen, getEmbedSize] = await this.getInputData();
+    const promptLookupPrefillTokens =
+      this.collectPromptLookupTokensFromInputData(inputData);
 
     // Check if LLMChatPipeline fits for forwarding image input
     const hasImageInput = inputData.some((data) => !Array.isArray(data));
@@ -928,6 +1020,7 @@ export class LLMChatPipeline {
         );
       }
     }
+    this.appendPromptLookupTokens(promptLookupPrefillTokens);
     this.imageDataCache.clear();
     this.tvm.endScope();
 
@@ -957,10 +1050,48 @@ export class LLMChatPipeline {
       throw Error("Cannot run decode when stopped");
     }
 
+    const promptLookupConfig = LLMChatPipeline.promptLookupConfig();
+    let forceSingleDecodeStep = false;
+    if (
+      promptLookupConfig !== undefined &&
+      this.canGreedyBurst(genConfig) &&
+      this.fargmaxLogits !== undefined &&
+      this.batchVerify !== undefined
+    ) {
+      const hybridForkEnabled =
+        promptLookupConfig.hybrid === "fork" &&
+        this.promptLookupHybridForkEnabled;
+      if (this.resolvedModelABI.needsRNNState && !hybridForkEnabled) {
+        this.promptLookupStats.enabled = false;
+        this.promptLookupStats.disabledReason = "rnn_state";
+        this.publishPromptLookupStats();
+      } else {
+        forceSingleDecodeStep = true;
+        this.promptLookupStats.enabled = true;
+        this.promptLookupStats.disabledReason = undefined;
+        this.ensurePromptLookupIndex(
+          promptLookupConfig.nMin,
+          promptLookupConfig.nMax,
+        );
+        const drafted = await this.decodePromptLookupStep(
+          promptLookupConfig,
+          hybridForkEnabled,
+          genConfig,
+        );
+        if (drafted) {
+          this.publishPromptLookupStats();
+          return;
+        }
+        this.promptLookupStats.noDraftPasses += 1;
+        this.publishPromptLookupStats();
+      }
+    }
+
     const burst = LLMChatPipeline.greedyBurstSize();
     // The GPU-resident path pays off with a burst of two or more, or with any
     // lookahead: K=1 plus lookahead streams every token yet never syncs idle.
     if (
+      !forceSingleDecodeStep &&
       (burst >= 2 || LLMChatPipeline.greedyLookahead() > 0) &&
       this.canGreedyBurst(genConfig)
     ) {
@@ -1071,6 +1202,334 @@ export class LLMChatPipeline {
     return Number.isInteger(lookahead) && lookahead > 0 ? lookahead : 0;
   }
 
+  private static promptLookupConfig(): PromptLookupRuntimeConfig | undefined {
+    const raw = (
+      globalThis as typeof globalThis & {
+        __webllmPromptLookup?: unknown;
+      }
+    ).__webllmPromptLookup;
+    if (raw === undefined || raw === null || typeof raw !== "object") {
+      return undefined;
+    }
+    const config = raw as {
+      k?: unknown;
+      nMin?: unknown;
+      nMax?: unknown;
+      hybrid?: unknown;
+    };
+    const k = Number(config.k);
+    if (!Number.isInteger(k) || k < 1) {
+      return undefined;
+    }
+    const nMaxRaw = Number(config.nMax);
+    const nMinRaw = Number(config.nMin);
+    const nMax = Number.isInteger(nMaxRaw) && nMaxRaw >= 1 ? nMaxRaw : 3;
+    let nMin = Number.isInteger(nMinRaw) && nMinRaw >= 1 ? nMinRaw : 2;
+    nMin = Math.min(nMin, nMax);
+    return {
+      k,
+      nMin,
+      nMax,
+      hybrid: config.hybrid === "fork" ? "fork" : undefined,
+    };
+  }
+
+  private static makePromptLookupStats(enabled: boolean): PromptLookupStats {
+    return {
+      enabled,
+      passes: 0,
+      draftPasses: 0,
+      noDraftPasses: 0,
+      draftedTokens: 0,
+      acceptedTokens: 0,
+      committedTokens: 0,
+      fullAcceptPasses: 0,
+      verifyMs: 0,
+      verifyLens: [],
+      verifyMsList: [],
+      acceptedHist: [],
+      rerunPasses: 0,
+      rerunTokens: 0,
+      rerunMs: 0,
+    };
+  }
+
+  private resetPromptLookupStatsForRound(): void {
+    const enabled = LLMChatPipeline.promptLookupConfig() !== undefined;
+    this.promptLookupStats = LLMChatPipeline.makePromptLookupStats(enabled);
+  }
+
+  private publishPromptLookupStats(): void {
+    const stats = this.promptLookupStats;
+    (
+      globalThis as typeof globalThis & {
+        __webllmPromptLookupStats?: PromptLookupStats;
+      }
+    ).__webllmPromptLookupStats = {
+      ...stats,
+      verifyLens: [...stats.verifyLens],
+      verifyMsList: [...stats.verifyMsList],
+      acceptedHist: [...stats.acceptedHist],
+    };
+  }
+
+  private resetPromptLookupSource(): void {
+    this.promptLookupSource = [];
+    if (this.promptLookupIndex === undefined) {
+      this.promptLookupIndex = new PromptLookupIndex();
+    }
+    this.promptLookupIndex.reset([]);
+  }
+
+  private ensurePromptLookupIndex(nMin: number, nMax: number): void {
+    if (this.promptLookupSource === undefined) {
+      this.promptLookupSource = [];
+    }
+    if (this.promptLookupIndex === undefined) {
+      this.promptLookupIndex = new PromptLookupIndex();
+    }
+    if (this.promptLookupNMin === undefined) {
+      this.promptLookupNMin = 2;
+    }
+    if (this.promptLookupNMax === undefined) {
+      this.promptLookupNMax = 3;
+    }
+    if (this.promptLookupNMin === nMin && this.promptLookupNMax === nMax) {
+      return;
+    }
+    this.promptLookupNMin = nMin;
+    this.promptLookupNMax = nMax;
+    this.promptLookupIndex = new PromptLookupIndex(
+      this.promptLookupSource,
+      nMin,
+      nMax,
+    );
+  }
+
+  private collectPromptLookupTokensFromInputData(
+    inputData: Array<Array<number> | ImageURL>,
+  ): number[] {
+    const tokens: number[] = [];
+    for (const data of inputData) {
+      if (Array.isArray(data)) {
+        tokens.push(...data);
+      }
+    }
+    return tokens;
+  }
+
+  private appendPromptLookupTokens(tokens: number[]): void {
+    if (this.promptLookupSource === undefined) {
+      this.promptLookupSource = [];
+    }
+    if (this.promptLookupIndex === undefined) {
+      this.promptLookupIndex = new PromptLookupIndex();
+    }
+    if (tokens.length === 0) {
+      return;
+    }
+    this.promptLookupSource.push(...tokens);
+    this.promptLookupIndex.appendTokens(tokens);
+  }
+
+  private getLiveSeqId(): number {
+    return this.liveSeqId === 1 ? 1 : 0;
+  }
+
+  private popTokensFromLiveSequence(count: number): void {
+    if (count <= 0) {
+      return;
+    }
+    for (const state of this.getActiveKVStates()) {
+      this.fKVCachePopN(
+        state,
+        new tvmjs.Scalar(this.getLiveSeqId(), "int64"),
+        new tvmjs.Scalar(count, "int32"),
+      );
+    }
+    this.filledKVCacheLength -= count;
+  }
+
+  private removeSequenceFromActiveStates(seqId: number): void {
+    for (const state of this.getActiveKVStates()) {
+      this.fKVCacheRemoveSequence(state, new tvmjs.Scalar(seqId, "int64"));
+    }
+  }
+
+  private forkSequenceInActiveStates(
+    parentSeqId: number,
+    childSeqId: number,
+  ): void {
+    for (const state of this.getActiveKVStates()) {
+      this.fKVCacheForkSequence(
+        state,
+        new tvmjs.Scalar(parentSeqId, "int64"),
+        new tvmjs.Scalar(childSeqId, "int64"),
+        new tvmjs.Scalar(-1, "int64"),
+      );
+    }
+  }
+
+  private processPromptLookupCommittedTokens(
+    committed: number[],
+    acceptedDrafts: number,
+    genConfig?: GenerationConfig,
+  ): { processed: number; processedDrafts: number } {
+    let processed = 0;
+    for (const token of committed) {
+      if (this.stopTriggered) {
+        break;
+      }
+      this.processNextToken(token, genConfig);
+      processed += 1;
+      if (this.stopTriggered) {
+        break;
+      }
+    }
+    return {
+      processed,
+      processedDrafts: Math.min(processed, acceptedDrafts),
+    };
+  }
+
+  private async batchVerifyArgmax(
+    tokens: number[],
+    seqId: number,
+  ): Promise<Int32Array> {
+    if (this.fargmaxLogits === undefined) {
+      throw new Error("InternalError: fargmaxLogits is not initialized.");
+    }
+    this.tvm.beginScope();
+    const embeddings = this.getTokensEmbeddings(tokens);
+    const allEmbeddings = embeddings.view([1].concat(embeddings.shape));
+    const logits = this.invokeBatchVerifyForward(
+      allEmbeddings,
+      tokens.length,
+      seqId,
+    );
+    const argmaxDevice = this.fargmaxLogits(
+      logits.view([tokens.length, this.fullVocabSize]),
+    );
+    const argmaxHost = this.tvm.detachFromCurrentScope(
+      this.tvm
+        .empty([tokens.length], "int32", this.tvm.cpu())
+        .copyFrom(argmaxDevice),
+    );
+    this.tvm.endScope();
+    await this.device.sync();
+    const argmax = argmaxHost.toArray() as Int32Array;
+    argmaxHost.dispose();
+    return argmax;
+  }
+
+  private batchVerifyNoLogits(tokens: number[], seqId: number): void {
+    this.tvm.beginScope();
+    const embeddings = this.getTokensEmbeddings(tokens);
+    const allEmbeddings = embeddings.view([1].concat(embeddings.shape));
+    this.invokeBatchVerifyForward(allEmbeddings, tokens.length, seqId);
+    this.tvm.endScope();
+  }
+
+  private async decodePromptLookupStep(
+    promptLookupConfig: PromptLookupRuntimeConfig,
+    hybridForkEnabled: boolean,
+    genConfig?: GenerationConfig,
+  ): Promise<boolean> {
+    this.promptLookupStats.passes += 1;
+    const promptDraft = this.promptLookupIndex.draft(promptLookupConfig.k);
+    if (promptDraft.length === 0) {
+      return false;
+    }
+    const maxDraft = Math.max(this.prefillChunkSize - 1, 0);
+    const draft = promptDraft.slice(0, maxDraft);
+    if (draft.length === 0) {
+      return false;
+    }
+    const previousToken = this.outputIds[this.outputIds.length - 1];
+    const verifyInput = [previousToken, ...draft];
+    const prevFilledKVCacheLength = this.filledKVCacheLength;
+    const isHybridForkPath =
+      this.resolvedModelABI.needsRNNState && hybridForkEnabled;
+    const liveSeqIdBeforePass = this.getLiveSeqId();
+    const scratchSeqId = 1 - liveSeqIdBeforePass;
+    if (isHybridForkPath) {
+      this.forkSequenceInActiveStates(liveSeqIdBeforePass, scratchSeqId);
+    }
+
+    this.promptLookupStats.draftPasses += 1;
+    this.promptLookupStats.draftedTokens += draft.length;
+    const verifyStart = performance.now();
+    const argmax = await this.batchVerifyArgmax(
+      verifyInput,
+      liveSeqIdBeforePass,
+    );
+    const verifyElapsedMs = performance.now() - verifyStart;
+    this.promptLookupStats.verifyMs += verifyElapsedMs;
+    this.promptLookupStats.verifyLens.push(verifyInput.length);
+    this.promptLookupStats.verifyMsList.push(verifyElapsedMs);
+
+    let acceptedDrafts = 0;
+    while (
+      acceptedDrafts < draft.length &&
+      argmax[acceptedDrafts] === draft[acceptedDrafts]
+    ) {
+      acceptedDrafts += 1;
+    }
+    this.promptLookupStats.acceptedTokens += acceptedDrafts;
+    this.promptLookupStats.acceptedHist.push(acceptedDrafts);
+    if (acceptedDrafts === draft.length) {
+      this.promptLookupStats.fullAcceptPasses += 1;
+    }
+
+    const correctionToken = Number(argmax[acceptedDrafts]);
+    const committed = [...draft.slice(0, acceptedDrafts), correctionToken];
+    const decodeStart = performance.now();
+    let processed = 0;
+    let processedDrafts = 0;
+    if (!isHybridForkPath) {
+      this.popTokensFromLiveSequence(draft.length - acceptedDrafts);
+      const processedResult = this.processPromptLookupCommittedTokens(
+        committed,
+        acceptedDrafts,
+        genConfig,
+      );
+      processed = processedResult.processed;
+      processedDrafts = processedResult.processedDrafts;
+      this.popTokensFromLiveSequence(acceptedDrafts - processedDrafts);
+    } else {
+      const processedResult = this.processPromptLookupCommittedTokens(
+        committed,
+        acceptedDrafts,
+        genConfig,
+      );
+      processed = processedResult.processed;
+      processedDrafts = processedResult.processedDrafts;
+      if (acceptedDrafts === draft.length && processedDrafts === draft.length) {
+        this.removeSequenceFromActiveStates(scratchSeqId);
+      } else {
+        this.removeSequenceFromActiveStates(liveSeqIdBeforePass);
+        const rerunTokens = [previousToken, ...draft.slice(0, processedDrafts)];
+        const rerunStart = performance.now();
+        this.batchVerifyNoLogits(rerunTokens, scratchSeqId);
+        const rerunElapsedMs = performance.now() - rerunStart;
+        this.promptLookupStats.rerunPasses += 1;
+        this.promptLookupStats.rerunTokens += rerunTokens.length;
+        this.promptLookupStats.rerunMs += rerunElapsedMs;
+        this.liveSeqId = scratchSeqId;
+      }
+      this.filledKVCacheLength = prevFilledKVCacheLength + 1 + processedDrafts;
+    }
+
+    this.promptLookupStats.committedTokens += processed;
+    const decodeElapsedSec =
+      (performance.now() - decodeStart + verifyElapsedMs) / 1e3;
+    this.decodingTotalTime += decodeElapsedSec;
+    this.decodingTotalTokens += processed;
+    this.curRoundDecodingTotalTokens += processed;
+    this.curRoundDecodingTotalTime += decodeElapsedSec;
+    return true;
+  }
+
   /**
    * The promise for every GPU->CPU readback issued so far, published by the
    * patched WebGPU runtime. Falls back to a full device sync on an unpatched
@@ -1113,11 +1572,13 @@ export class LLMChatPipeline {
    * entries are popped as well; callers that clear the cache anyway pass false.
    */
   private drainGreedyPipeline(rollbackKV: boolean): void {
-    const extra = this.greedyInflight.length;
+    const inflight = this.greedyInflight ?? [];
+    const extra = inflight.length;
     if (extra === 0) {
+      this.greedyInflight = [];
       return;
     }
-    for (const entry of this.greedyInflight) {
+    for (const entry of inflight) {
       // The readback may still be in flight and will write into `host` when it
       // lands, so release both tensors only once it has settled. It rejects
       // only if the device is destroyed first; then there is nothing to free.
@@ -1136,7 +1597,7 @@ export class LLMChatPipeline {
       for (const state of this.getActiveKVStates()) {
         this.fKVCachePopN(
           state,
-          new tvmjs.Scalar(0, "int64"),
+          new tvmjs.Scalar(this.getLiveSeqId(), "int64"),
           new tvmjs.Scalar(extra, "int32"),
         );
       }
@@ -1210,6 +1671,9 @@ export class LLMChatPipeline {
 
     let extra = done.length - processed;
     if (this.stopTriggered) {
+      if (this.greedyInflight.length > 0) {
+        await this.greedyInflight[this.greedyInflight.length - 1].ready;
+      }
       extra += this.greedyInflight.length;
       this.drainGreedyPipeline(false);
     }
@@ -1217,7 +1681,7 @@ export class LLMChatPipeline {
       for (const state of this.getActiveKVStates()) {
         this.fKVCachePopN(
           state,
-          new tvmjs.Scalar(0, "int64"),
+          new tvmjs.Scalar(this.getLiveSeqId(), "int64"),
           new tvmjs.Scalar(extra, "int32"),
         );
       }
@@ -1233,7 +1697,7 @@ export class LLMChatPipeline {
 
   private invokeDecodeGreedy(tokenGpu: tvmjs.Tensor): tvmjs.Tensor {
     const inputLenShape = this.tvm.makeShapeTuple([1]);
-    const seqIdsTuple = this.tvm.makeShapeTuple([0]);
+    const seqIdsTuple = this.tvm.makeShapeTuple([this.getLiveSeqId()]);
     const forwardStates = this.getActiveKVStates();
     for (const state of forwardStates) {
       this.fKVCacheBeginForward!(state, seqIdsTuple, inputLenShape);
@@ -1255,7 +1719,7 @@ export class LLMChatPipeline {
     const embed = this.getTokensEmbeddingsFromGpu(tokenGpu);
     const allEmbeddings = embed.view([1].concat(embed.shape));
     const inputLenShape = this.tvm.makeShapeTuple([1]);
-    const seqIdsTuple = this.tvm.makeShapeTuple([0]);
+    const seqIdsTuple = this.tvm.makeShapeTuple([this.getLiveSeqId()]);
     const forwardStates = this.getActiveKVStates();
     for (const state of forwardStates) {
       this.fKVCacheBeginForward!(state, seqIdsTuple, inputLenShape);
@@ -1338,6 +1802,7 @@ export class LLMChatPipeline {
     }
     if (!this.stopTriggered) {
       this.outputIds.push(nextToken);
+      this.appendPromptLookupTokens([nextToken]);
       // Update token appearance frequency
       const curFreq = this.appearedTokensFreq.get(nextToken);
       if (curFreq !== undefined) {
@@ -1610,7 +2075,7 @@ export class LLMChatPipeline {
 
     // 3. Forward the concatenated embeddings
     const inputLenShape = this.tvm.makeShapeTuple([inputDataLen]);
-    const seqIdsTuple = this.tvm.makeShapeTuple([0]);
+    const seqIdsTuple = this.tvm.makeShapeTuple([this.getLiveSeqId()]);
     const forwardStates = this.getActiveKVStates();
     for (const state of forwardStates) {
       this.fKVCacheBeginForward!(state, seqIdsTuple, inputLenShape);
@@ -1681,6 +2146,7 @@ export class LLMChatPipeline {
     return {
       prefill: registry.prefill !== undefined,
       batch_prefill: registry.batch_prefill !== undefined,
+      batch_verify: registry.batch_verify !== undefined,
       decode: registry.decode !== undefined,
       batch_decode: registry.batch_decode !== undefined,
       create_tir_paged_kv_cache:
@@ -1939,6 +2405,55 @@ export class LLMChatPipeline {
       this.getSingleStateForABI(),
       this.params,
     );
+  }
+
+  private invokeBatchVerify(allEmbeddings: tvmjs.Tensor): any {
+    if (this.batchVerify === undefined) {
+      throw new Error("InternalError: batch_verify is not initialized.");
+    }
+    if (
+      this.resolvedModelABI.needsKVCache &&
+      this.resolvedModelABI.needsRNNState
+    ) {
+      return this.batchVerify(
+        allEmbeddings,
+        this.requireKVCache(),
+        this.requireRNNState(),
+        this.params,
+      );
+    }
+    if (
+      this.resolvedModelABI.needsKVCache &&
+      !this.resolvedModelABI.needsRNNState
+    ) {
+      return this.batchVerify(
+        allEmbeddings,
+        this.requireKVCache(),
+        this.params,
+      );
+    }
+    throw new Error(
+      "InternalError: batch_verify is only supported for kv-cache backed models.",
+    );
+  }
+
+  private invokeBatchVerifyForward(
+    allEmbeddings: tvmjs.Tensor,
+    inputDataLen: number,
+    seqId: number,
+  ): tvmjs.Tensor {
+    const inputLenShape = this.tvm.makeShapeTuple([inputDataLen]);
+    const seqIdsTuple = this.tvm.makeShapeTuple([seqId]);
+    const forwardStates = this.getActiveKVStates();
+    for (const state of forwardStates) {
+      this.fKVCacheBeginForward!(state, seqIdsTuple, inputLenShape);
+    }
+    const retValue = this.invokeBatchVerify(allEmbeddings);
+    for (let i = forwardStates.length - 1; i >= 0; --i) {
+      this.fKVCacheEndForward!(forwardStates[i]);
+    }
+    this.filledKVCacheLength += inputDataLen;
+    return retValue.get(0);
   }
 
   // NOTE: caller must call device.sync()

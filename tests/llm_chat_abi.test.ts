@@ -7,6 +7,7 @@ function makeAvailability(overrides: Partial<AnyObj> = {}) {
   return {
     prefill: false,
     batch_prefill: false,
+    batch_verify: false,
     decode: false,
     batch_decode: false,
     create_tir_paged_kv_cache: false,
@@ -185,6 +186,48 @@ test("hybrid invoke path passes kv cache and rnn state in ABI order", () => {
   );
 });
 
+test("batch_verify invoke path uses ABI-specific signature", () => {
+  const pipeline = Object.create(LLMChatPipeline.prototype) as AnyObj;
+  pipeline.batchVerify = jest.fn(() => ({ get: jest.fn() }));
+  pipeline.kvCache = { kind: "kv" };
+  pipeline.rnnState = { kind: "rnn" };
+  pipeline.params = { kind: "params" };
+
+  pipeline.resolvedModelABI = {
+    kvStateKind: "kv_cache",
+    prefillABI: "batch",
+    decodeABI: "batch",
+    prefillFunctionName: "batch_prefill",
+    decodeFunctionName: "batch_decode",
+    needsKVCache: true,
+    needsRNNState: false,
+  };
+  pipeline.invokeBatchVerify({ kind: "emb" });
+  expect(pipeline.batchVerify).toHaveBeenCalledWith(
+    { kind: "emb" },
+    pipeline.kvCache,
+    pipeline.params,
+  );
+
+  pipeline.batchVerify.mockClear();
+  pipeline.resolvedModelABI = {
+    kvStateKind: "hybrid",
+    prefillABI: "batch",
+    decodeABI: "batch",
+    prefillFunctionName: "batch_prefill",
+    decodeFunctionName: "batch_decode",
+    needsKVCache: true,
+    needsRNNState: true,
+  };
+  pipeline.invokeBatchVerify({ kind: "emb2" });
+  expect(pipeline.batchVerify).toHaveBeenCalledWith(
+    { kind: "emb2" },
+    pipeline.kvCache,
+    pipeline.rnnState,
+    pipeline.params,
+  );
+});
+
 test("embedAndForward begins and ends forward for all active states", async () => {
   const pipeline = Object.create(LLMChatPipeline.prototype) as AnyObj;
   const kvState = { id: "kv" };
@@ -207,6 +250,7 @@ test("embedAndForward begins and ends forward for all active states", async () =
   pipeline.prefillLogitPositionHost = new Int32Array(1);
   pipeline.prefillLogitPositions = { copyFrom: jest.fn() };
   pipeline.filledKVCacheLength = 0;
+  pipeline.liveSeqId = 0;
   pipeline.tvm = {
     beginScope: jest.fn(),
     endScope: jest.fn(),
